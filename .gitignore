@@ -1,0 +1,5 @@
+*.txt
+regs*
+roms
+*.zip
+8088

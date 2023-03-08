@@ -1,378 +1,297 @@
 #include "cpu.h"
 #include "microcode.h"
-#include "../bus/Bus.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
-uint8_t code[] =
+void CPU8088::WriteM(uint16_t data)
 {
-	0xb4, 0xd5, // MOV AH, 0xD5
-	0x9e, // SAHF
-}; // A flat array for now
-
-bool prefetch_scheduled = false;
-int cycles_till_prefetch = 0;
-int delay_cycles = 0;
-bool prefetch_paused = true;
-bool opcode_fetched = true;
-bool is_memory = false;
-bool ready = true; // The ready pin, if it's not true, we go to W-state and start waiting. Used by DMA and CGA
-
-union
-{
-	uint16_t value;
-	struct
+	if (is_memory)
 	{
-		uint8_t lo, hi;
-	};
-} regs[8];
+		printf("[emu/8088]: Unhandled write to M -> memory\n");
+		exit(1);
+	}
+	else if (is_word_targeted)
+	{
+		printf("[emu/8088]: Unhandled write to M -> 16-bit register\n");
+		exit(1);
+	}
+	else if (!is_word_targeted)
+	{
+		WriteReg8(target_reg_addr, data);
+	}
+}
 
-void write_reg8(int reg, uint8_t data)
+uint16_t CPU8088::ReadM()
+{
+	if (is_word_targeted)
+	{
+		printf("[emu/8088]: Unhandled 16-bit M read\n");
+		exit(1);
+	}
+	else
+	{
+		switch (modrm.mod)
+		{
+		case 3:
+			return ReadReg8(modrm.rm);
+		}
+	}
+}
+
+uint8_t CPU8088::ReadReg8(int reg)
 {
 	if (reg < 4)
-		regs[reg].lo = data;
+		return regs[reg].reg8_lo;
 	else
-		regs[reg - 4].hi = data;
+		return regs[reg - 4].reg8_hi;
 }
 
-void CPU8088::write_m(uint16_t data)
+void CPU8088::WriteReg8(int reg, uint8_t data)
 {
-	if (is_memory || is_word)
+	if (reg < 4)
+		regs[reg].reg8_lo = data;
+	else
+		regs[reg - 4].reg8_hi = data;
+}
+
+// Returns whether we should run a microcode for modr/m or not
+bool CPU8088::TranslateModrm()
+{
+	switch (modrm.mod)
 	{
+	case 3:
+		return false;
+	default:
+		printf("[emu/8088]: Unknown modr/m mode %d\n", modrm.mod);
 		exit(1);
 	}
-	else
-	{
-		if (is_word)
-			;
-		else
-			write_reg8(target_reg, data);
-	}
 }
 
-int t_state = 1;
-int cycles = 0;
-
-CPU8088::CPU8088()
+bool CPU8088::PassedCond(uint8_t cond)
 {
-	ucode_ptr = ucode_reset;
-	ucode_ip = 0;
-}
+	bool condPassed = false;
 
-void CPU8088::Clock()
-{
-	if (!ready)
+	switch (cond & 0xE)
 	{
-		t_state = 5;
-		printf("W: Waiting on ready pin\n");
-		return;
-	}
-
-	printf("%d (%05d): ", t_state, cycles++);
-
-cpu_step:
-	if (!prefetch_scheduled && !prefetch_paused)
-	{
-		prefetch_scheduled = true;
-		cycles_till_prefetch = 1;
-		printf("Scheduled          ");
-	}
-	else if (prefetch_scheduled)
-	{
-		if (cycles_till_prefetch != 0)
-		{
-			printf("Scheduled(%d)       ", 1 - cycles_till_prefetch);
-			cycles_till_prefetch--;
-			t_state++;
-			if (cycles_till_prefetch == 0)
-			{
-				delay_cycles = 2;
-			}
-		}
-		else if (cycles_till_prefetch == 0)
-		{
-			printf("FETCHING(%d)        ", 2 - delay_cycles);
-			if (delay_cycles)
-			{
-				t_state++;
-				delay_cycles--;
-			}
-			else if (q.size() < 4)
-			{
-				q.push(Bus::Read8(TranslateAddr(ip++, cs)));
-				printf("\b\b\b\b\b\b0x%02x  ", q.front());
-				prefetch_scheduled = false;
-				prefetch_paused = false;
-				t_state = 1;
-			}
-			else
-			{
-				t_state = 1;
-				prefetch_paused = true;
-			}
-		}
-	}
-	else if (prefetch_paused)
-	{
-		printf("IDLE               ");
-	}
-
-	if (!opcode_fetched)
-	{
-		if (q.size() == 0)
-		{
-			printf("[8088]: Waiting on prefetch queue\n");
-			return;
-		}
-
-		opcode_fetched = true;
-		cur_opcode = q.front();
-		q.pop();
-
-		ucode_ip = 0;
-
-		switch (cur_opcode)
-		{
-		case 0x9e:
-			ucode_ptr = ucode_sahf;
-			break;
-		case 0xb0:
-		case 0xb1:
-		case 0xb2:
-		case 0xb3:
-		case 0xb4:
-		case 0xb5:
-		case 0xb6:
-		case 0xb7:
-		case 0xb8:
-			target_reg = cur_opcode - 0xb0;
-			ucode_ptr = ucode_mov_r_i;
-			is_word = false;
-			break;
-		case 0xea:
-			ucode_ptr = ucode_jmp_far;
-			break;
-		case 0xfa:
-			flags &= ~0x200;
-			cur_opcode = 0;
-			opcode_fetched = false;
-			printf("cli\n");
-			return;
-		default:
-			printf("[8088]: Unknown opcode 0x%02x\n", cur_opcode);
-			exit(1);
-		}
-	}
-
-	uint32_t micro_op = ucode_ptr[ucode_ip++];
-	int s = ((micro_op >> 13) & 1) + ((micro_op >> 10) & 6) + ((micro_op >> 11) & 0x18);
-    int dd = ((micro_op >> 20) & 1) + ((micro_op >> 18) & 2) + ((micro_op >> 16) & 4) + ((micro_op >> 14) & 8) + ((micro_op >> 12) & 0x10);
-
-	uint16_t data;
-
-	switch (s)
-	{
-	case 0x05:
-		printf("IND   ->");
-		break;
-	case 0x07:
-		if (!q.size())
-		{
-			printf("Stalling for prefetch queue\n");
-			ucode_ip--;
-			return;
-		}
-		data = q.front();
-		q.pop();
-		printf("Q    -> ");
-		break;
-	case 0x0c:
-		printf("tmpa -> ");
-		data = tmpa;
-		break;
-	case 0x0d:
-		printf("tmpb -> ");
-		data = tmpb;
-		break;
-	case 0x0f:
-		printf("F    -> ");
-		data = flags;
-		break;
-	case 0x10:
-		printf("X    -> ");
-		data = regs[0].hi;
-		break;
-	case 0x15:
-		printf("ONES -> ");
-		data = 0xffff;
-		break;
-	case 0x17:
-		printf("ZERO -> ");
-		data = 0;
+	case 2:
+		condPassed = (flags >> 0) & 1;
 		break;
 	default:
-		printf("[8088]: Unknown source register %d %x\n", s, s);
+		printf("[emu/8088]: Unknown cond %d\n", cond);
 		exit(1);
 	}
 
-	switch (dd)
+	if (!(cond & 1))
+		condPassed = !condPassed;
+	
+	return condPassed;
+}
+
+void CPU8088::RunMicroOp(uint32_t d)
+{
+	printf("0x%06x: ", d);
+
+	int s = ((d >> 13) & 1) + ((d >> 10) & 6) + ((d >> 11) & 0x18);
+    int dd = ((d >> 20) & 1) + ((d >> 18) & 2) + ((d >> 16) & 4) + ((d >> 14) & 8) + ((d >> 12) & 0x10);
+    int typ = (d >> 7) & 7;
+    if ((typ & 4) == 0)
+        typ >>= 1;
+
+	// Step one, do a basic move operation between a source and a destination
+
+	bool cont;
+	uint16_t source = FetchMicroRegister(s, cont);
+
+	if (!cont)
+		return;
+
+	WriteMicroRegister(dd, source);
+
+	// Step two, do some type-specific operations
+
+	switch (typ)
+	{
+	default:
+		printf("[emu/8088]: Unknown type %d\n", typ);
+		exit(1);
+	}
+}
+
+uint16_t CPU8088::FetchMicroRegister(int reg, bool& cont)
+{
+	cont = true;
+
+	switch (reg)
+	{
+	case 7:
+	{
+		uint8_t ret;
+		if (!biu.Read8Queue(ret))
+		{
+			printf("Stalling on read from Q\n");
+			cont = false;
+			ucode_ip--; // Rerun the current ucode until Q is ready
+			return 0;
+		}
+		printf("Q       ->    ");
+		return ret;
+	}
+	case 12:
+		printf("tmpa    ->    ");
+		return tmpa;
+	case 13:
+		printf("tmpb    ->    ");
+		return tmpb;
+	case 15:
+		printf("F       ->    ");
+		return flags;
+	case 16:
+		printf("X       ->    ");
+		return regs[0].reg8_hi;
+	case 18:
+		printf("M       ->    ");
+		return ReadM();
+	case 21:
+		printf("ONES    ->    ");
+		return 0xffff;
+	case 23:
+		printf("ZERO    ->    ");
+		return 0;
+	case 25:
+		printf("BC      ->    ");
+		return regs[CX].reg16;
+	default:
+		printf("[emu/8088]: Cannot fetch unknown register %d\n", reg);
+		exit(1);
+	}
+}
+
+void CPU8088::WriteMicroRegister(int reg, uint16_t data)
+{
+	switch (reg)
 	{
 	case 0:
-		printf("RA    ");
-		es = data;
+		printf("RA   \t");
+		segments[ES] = data;
 		break;
 	case 1:
-		printf("RC    ");
-		cs = data;
+		printf("RC   \t");
+		segments[CS] = data;
 		break;
 	case 2:
-		printf("RS    ");
-		ss = data;
+		printf("RS   \t");
+		segments[SS] = data;
 		break;
 	case 3:
-		printf("RD    ");
-		ds = data;
+		printf("RD   \t");
+		segments[DS] = data;
 		break;
 	case 4:
+		printf("PC   \t");
 		ip = data;
-		printf("PC    ");
 		break;
 	case 7:
-		printf("\b\b\b\b\b\b\b\b           ");
+		for (int i = 0; i < 14; i++)
+			printf("\b");
+		printf("                   \t");
 		break;
 	case 12:
+		printf("tmpa \t");
 		tmpa = data;
-		printf("tmpa  ");
+		break;
+	case 13:
+		printf("tmpb \t");
+		tmpb = data;
 		break;
 	case 15:
-		flags = data;
-		flags |= 2; // Bit 2 is always set
-		printf("F     ");
+		printf("F    \t");
+		flags = data | 0x2;
+		break;
+	case 16:
+		printf("X    \t");
+		regs[0].reg8_hi = data;
 		break;
 	case 18:
-		write_m(data);
-		printf("M     ");
+		printf("M    \t");
+		WriteM(data);
 		break;
 	case 20:
 		tmpa &= ~0xFF;
 		tmpa |= data;
-		printf("tmpaL ");
+		printf("tmpaL\t");
 		break;
 	case 21:
 		tmpb &= ~0xFF;
 		tmpb |= data;
-		printf("tmpbL ");
+		printf("tmpbL\t");
 		break;
 	case 22:
 		tmpa &= 0xFF;
 		tmpa |= (data << 8);
-		printf("tmpaH ");
+		printf("tmpaH\t");
 		break;
 	case 23:
 		tmpb &= 0xFF;
 		tmpb |= (data << 8);
-		printf("tmpbH ");
+		printf("tmpbH\t");
 		break;
 	default:
-		printf("[8088]: Unknown dest register %d\n", dd);
-		exit(1);
-	}
-	
-	if (dd != 7)
-		printf("0x%02x\t", data);
-	else
-		printf("          \t");
-
-	int type = (micro_op >> 7) & 7;
-
-	if ((type & 4) == 0)
-		type >>= 1;
-
-	switch (type)
-	{
-	case 0:
-	case 5:
-	case 7:
-		switch ((micro_op >> 4) & 0xf)
-		{
-		case 0x02:
-			printf("L8   \t");
-			if (!is_word)
-				ucode_ip += 1; // Skip the next instruction
-			break;
-		default:
-			printf("[8088]: Unknown u-op sub-op type 0 %d\n", (micro_op >> 4) & 0xf);
-			exit(1);
-		}
-
-		if (type == 5)
-		{
-			printf("Type 5\n");
-			exit(1);
-		}
-		else
-			printf("\n");
-		break;
-	case 4:
-		switch ((micro_op >> 3) & 0xf)
-		{
-		case 0x01:
-		{
-			printf("FLUSH\t");
-			std::queue<uint8_t> empty;
-			q.swap(empty);
-			prefetch_paused = false;
-			break;
-		}
-		case 0x0f:
-			printf("NONE \t");
-			break; // None			
-		default:
-			printf("[8088]: Unknown u-op sub-op type %d\n", (micro_op >> 3) & 0xf);
-			exit(1);
-		}
-
-		switch (micro_op & 7)
-		{
-		case 0:
-			printf("RNI\n");
-			cur_opcode = 0;
-			opcode_fetched = false;
-			break;
-		case 3:
-			printf("SUSP\n");
-			prefetch_paused = true;
-			break;
-		case 5:
-			printf("NX\n           ");
-			goto cpu_step;
-			break;
-		case 7:
-			printf("NONE\n");
-			break;
-		default:
-			printf("[8088]: Unknown u-op sub-op2 type %d\n", micro_op & 7);
-			exit(1);
-		}
-		break;
-	default:
-		printf("[8088]: Unknown u-op type %d\n", type);
+		printf("[emu/8088]: Cannot write to unknown register %d\n", reg);
 		exit(1);
 	}
 }
 
+CPU8088::CPU8088()
+{
+	ucode_ip = 0x1E4;
+	cur_opcode = 0;
+	has_cur_opcode = true; // So we don't skip reset
+	biu.AttachCPU(this);
+}
+
+int global_cycles = 0;
+
+void CPU8088::Clock()
+{
+	global_cycles++;
+	printf("(%04d): ", global_cycles);
+
+	biu.Tick();
+
+	if (!has_cur_opcode)
+	{
+		if (!biu.Read8Queue(cur_opcode))
+		{
+			printf("Waiting on prefetch queue\n");
+			return;
+		}
+		
+		has_cur_opcode = true;
+
+		switch (cur_opcode)
+		{
+		default:
+			printf("[emu/8088]: Unknown opcode 0x%02x\n", cur_opcode);
+			exit(1);
+		}
+	}
+
+	uint32_t micro_op = ucode[ucode_ip++];
+
+	RunMicroOp(micro_op);
+}
+
 void CPU8088::Dump()
 {
-	printf("flags\t->\t0x%04x\n", flags);
-	printf("0x%04x:0x%04x\n", cs, ip);
+	for (int i = 0; i < 8; i++)
+		printf("R%d\t->\t0x%04x\n", i, regs[i].reg16);
 }
 
 extern CPU8088* cpu;
 
 void Dump()
 {
-	for (int i = 0; i < 8; i++)
-		printf("r%d\t->\t0x%04x\n", i, regs[i].value);
 	cpu->Dump();
 }
